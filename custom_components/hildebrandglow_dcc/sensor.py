@@ -21,6 +21,7 @@ from homeassistant.helpers.update_coordinator import (
     DataUpdateCoordinator,
     UpdateFailed,
 )
+from homeassistant.util import dt as dt_util
 
 from .const import DOMAIN
 
@@ -158,8 +159,14 @@ def should_update() -> bool:
     return (0 <= minutes <= 5) or (30 <= minutes <= 35)
 
 
-async def daily_data(hass: HomeAssistant, resource) -> float | None:
-    """Get daily usage from the API."""
+async def daily_data(
+    hass: HomeAssistant, resource
+) -> tuple[float, datetime] | tuple[None, None]:
+    """Get daily usage from the API.
+
+    Returns the total for the day along with the start of that day, which the
+    cost sensor exposes as its last_reset.
+    """
     # If it's before 01:06, we need to fetch yesterday's data
     # Should only need to be before 00:36 but gas data can be 30 minutes behind electricity data
     if datetime.now().time() <= time(1, 5):
@@ -167,6 +174,8 @@ async def daily_data(hass: HomeAssistant, resource) -> float | None:
         now = datetime.now() - timedelta(days=1)
     else:
         now = datetime.now()
+    # Timezone-aware start of the day the readings cover
+    day_start = dt_util.start_of_local_day(now.date())
     # Round to the day to set time to 00:00:00
     t_from = await hass.async_add_executor_job(resource.round, now, "P1D")
     # Round to the minute
@@ -190,7 +199,7 @@ async def daily_data(hass: HomeAssistant, resource) -> float | None:
     )
     if not readings:
         _LOGGER.debug("No readings returned for resource id %s", resource.id)
-        return None
+        return None, None
 
     _LOGGER.debug("Readings for %s has %s entries", resource.classifier, len(readings))
     total = 0.0
@@ -198,7 +207,7 @@ async def daily_data(hass: HomeAssistant, resource) -> float | None:
     for reading in readings[:2]:
         if reading[1] is not None and reading[1].value is not None:
             total += reading[1].value
-    return total
+    return total, day_start
 
 
 async def tariff_data(hass: HomeAssistant, resource):
@@ -275,7 +284,7 @@ class Usage(SensorEntity):
         # Get data on initial startup, then only when new data might be available
         if self.initialised and not should_update():
             return
-        value = await daily_data(self.hass, self.resource)
+        value, _ = await daily_data(self.hass, self.resource)
         if value is not None:
             self._attr_native_value = round(value, 2)
             self.initialised = True
@@ -288,7 +297,9 @@ class Cost(SensorEntity):
     _attr_has_entity_name = True
     _attr_name = "Cost (today)"
     _attr_native_unit_of_measurement = "GBP"
-    _attr_state_class = SensorStateClass.TOTAL_INCREASING
+    # The monetary device class only permits TOTAL. The sensor resets to zero
+    # each day, so last_reset is published alongside it to mark the boundary.
+    _attr_state_class = SensorStateClass.TOTAL
 
     def __init__(self, hass: HomeAssistant, resource, virtual_entity) -> None:
         """Initialize the sensor."""
@@ -316,9 +327,10 @@ class Cost(SensorEntity):
         # Get data on initial startup, then only when new data might be available
         if self.initialised and not should_update():
             return
-        value = await daily_data(self.hass, self.resource)
+        value, day_start = await daily_data(self.hass, self.resource)
         if value is not None:
             self._attr_native_value = round(value / 100, 2)
+            self._attr_last_reset = day_start
             self.initialised = True
 
 
