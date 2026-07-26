@@ -53,6 +53,9 @@ class ConfigFlow(config_entries.ConfigFlow, domain=DOMAIN):
                 step_id="user", data_schema=STEP_USER_DATA_SCHEMA
             )
 
+        await self.async_set_unique_id(user_input["username"].lower())
+        self._abort_if_unique_id_configured()
+
         errors = {}
 
         # Test authenticating with the API

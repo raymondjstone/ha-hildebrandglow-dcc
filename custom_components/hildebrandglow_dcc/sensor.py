@@ -97,13 +97,21 @@ async def async_setup_entry(
 
         # Cost sensors must be created after usage sensors as they reference them as a meter
         for resource in resources:
-            if resource.classifier == "gas.consumption.cost":
+            if resource.classifier in (
+                "gas.consumption.cost",
+                "electricity.consumption.cost",
+            ):
+                meter_classifier = resource.classifier.removesuffix(".cost")
+                meter = meters.get(meter_classifier)
+                if meter is None:
+                    _LOGGER.error(
+                        "No matching usage sensor found for %s (id: %s). Please open an issue",
+                        resource.classifier,
+                        resource.id,
+                    )
+                    continue
                 cost_sensor = Cost(hass, resource, virtual_entity)
-                cost_sensor.meter = meters["gas.consumption"]
-                entities.append(cost_sensor)
-            elif resource.classifier == "electricity.consumption.cost":
-                cost_sensor = Cost(hass, resource, virtual_entity)
-                cost_sensor.meter = meters["electricity.consumption"]
+                cost_sensor.meter = meter
                 entities.append(cost_sensor)
 
     # Get data for all entities on initial startup
@@ -276,14 +284,14 @@ class Usage(SensorEntity):
         # Get data on initial startup
         if not self.initialised:
             value = await daily_data(self.hass, self.resource)
-            if value:
+            if value is not None:
                 self._attr_native_value = round(value, 2)
                 self.initialised = True
         else:
             # Only update the sensor if it's between 0-5 or 30-35 minutes past the hour
             if await should_update():
                 value = await daily_data(self.hass, self.resource)
-                if value:
+                if value is not None:
                     self._attr_native_value = round(value, 2)
 
 
@@ -321,14 +329,14 @@ class Cost(SensorEntity):
         """Fetch new data for the sensor."""
         if not self.initialised:
             value = await daily_data(self.hass, self.resource)
-            if value:
+            if value is not None:
                 self._attr_native_value = round(value / 100, 2)
                 self.initialised = True
         else:
             # Only update the sensor if it's between 0-5 or 30-35 minutes past the hour
             if await should_update():
                 value = await daily_data(self.hass, self.resource)
-                if value:
+                if value is not None:
                     self._attr_native_value = round(value / 100, 2)
 
 
