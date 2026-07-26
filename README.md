@@ -57,9 +57,16 @@ Once you've authenticated, the integration will automatically set up the followi
 
 The usage and cost sensors will still show the previous day's data until shortly after 01:30 to ensure that all of the previous day's data is collected.
 
-The standing charge and rate sensors are disabled by default as they are less commonly used. Before enabling them, ensure the data is visible in the Bright app.
-
 If the data being shown is wrong, check the Bright app first. If it is also wrong there, you will need to contact your supplier and tell them to fix the data being provided to DCC Other Users, as Bright is one of these.
+
+### Update frequency
+
+Hildebrand's DCC backend only publishes new smart meter readings roughly twice an hour, so all sensors are refreshed on the same cadence rather than continuously:
+
+- Home Assistant polls the integration every 5 minutes, but a new API request is only actually made when the clock is between :00-:05 or :30-:35 past the hour. Outside of those windows, the sensors keep their last known value.
+- This applies to all four sensors: Usage, Cost, Standing Charge and Rate. The two tariff sensors (Standing Charge and Rate) share a single update per resource, driven by a single coordinator, so they always update together.
+- In practice this means you should expect each sensor's value (and its "last updated" time) to change shortly after each half hour, not every 5 minutes.
+- If a sensor hasn't updated for longer than about 35 minutes, first check that the data is up to date in the Bright app, then enable [debug logging](#debugging) and look for errors from the integration.
 
 ## Energy Management
 
