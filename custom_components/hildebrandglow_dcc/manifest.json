@@ -9,8 +9,6 @@
   "integration_type": "hub",
   "iot_class": "cloud_polling",
   "issue_tracker": "https://github.com/raymondjstone/ha-hildebrandglow-dcc/issues",
-  "requirements": [
-    "pyglowmarkt==0.5.5"
-  ],
-  "version": "1.1.0"
+  "requirements": [],
+  "version": "1.2.0"
 }

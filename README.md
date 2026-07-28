@@ -7,7 +7,7 @@
 
 Home Assistant integration for energy consumption data from UK SMETS (Smart) meters using the Hildebrand Glow API.
 
-Forked from the orginal abandoned version to fix some issues.
+This is a fork of the original [HandyHat/ha-hildebrandglow-dcc](https://github.com/HandyHat/ha-hildebrandglow-dcc) project, which is no longer maintained, updated to fix issues with sensors no longer updating.
 
 This integration works without requiring a consumer device provided by Hildebrand Glow and can work with your existing smart meter. You'll need to set up your smart meter for free in the Bright app on [Android](https://play.google.com/store/apps/details?id=uk.co.hildebrand.brightionic&hl=en_GB) or [iOS](https://apps.apple.com/gb/app/bright/id1369989022). This will only work when using the Data Communications Company (DCC) backend, which all [SMETS 2 meters](https://www.smartme.co.uk/smets-2.html) and some [SMETS 1 meters](https://www.smartme.co.uk/smets-1.html) do. Once you can see your data in the app, you are good to go.
 
@@ -66,6 +66,7 @@ Hildebrand's DCC backend only publishes new smart meter readings roughly twice a
 - Home Assistant polls the integration every 5 minutes, but a new API request is only actually made when the clock is between :00-:05 or :30-:35 past the hour. Outside of those windows, the sensors keep their last known value.
 - This applies to all four sensors: Usage, Cost, Standing Charge and Rate. The two tariff sensors (Standing Charge and Rate) share a single update per resource, driven by a single coordinator, so they always update together.
 - In practice this means you should expect each sensor's value (and its "last updated" time) to change shortly after each half hour, not every 5 minutes.
+- The Glow API access token expires after 7 days. The integration renews it automatically ahead of expiry, so no restart is needed to keep data flowing.
 - If a sensor hasn't updated for longer than about 35 minutes, first check that the data is up to date in the Bright app, then enable [debug logging](#debugging) and look for errors from the integration.
 
 ## Energy Management
@@ -98,7 +99,7 @@ python -m venv dev-venv
 You can then install the dependencies that will allow you to develop:
 `pip3 install -r requirements-dev.txt`
 
-This will install `black`, `homeassistant`, `isort`, `pyglowmarkt` and `pylint`.
+This will install `black`, `homeassistant`, `isort` and `pylint`. The integration itself has no external dependencies: it talks to the Glowmarkt API directly via `custom_components/hildebrandglow_dcc/glow_api.py`.
 
 ### Code Style
 
@@ -108,11 +109,13 @@ This project makes use of black, isort and pylint to enforce a consistent code s
 
 Thanks go to:
 
-- The [pyglowmarkt](https://github.com/cybermaggedon/pyglowmarkt) library, which is used to interact with the Hildebrand API.
+- [HandyHat](https://github.com/HandyHat) and the [HandyHat/ha-hildebrandglow-dcc](https://github.com/HandyHat/ha-hildebrandglow-dcc) project, the original version from which this fork is derived.
+
+- The [pyglowmarkt](https://github.com/cybermaggedon/pyglowmarkt) library, which was used to interact with the Hildebrand API before the integration switched to its own API client.
 
 - The Hildebrand API [documentation](https://docs.glowmarkt.com/GlowmarktAPIDataRetrievalDocumentationIndividualUserForBright.pdf) and [Swagger UI](https://api.glowmarkt.com/api-docs/v0-1/resourcesys/).
 
-- The [original project](https://github.com/unlobito/ha-hildebrandglow) from which this project is forked.
+- The [original project](https://github.com/unlobito/ha-hildebrandglow) from which HandyHat's project was forked.
 
 - The [Hildebrand-Glow-Python-Library](https://github.com/ghostseven/Hildebrand-Glow-Python-Library), used for understanding the API.
 

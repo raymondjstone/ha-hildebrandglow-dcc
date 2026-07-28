@@ -1,11 +1,10 @@
 """Platform for sensor integration."""
 from __future__ import annotations
 
-from collections.abc import Callable
+from collections.abc import Callable, Coroutine
 from datetime import datetime, time, timedelta
 import logging
-
-import requests
+from typing import Any
 
 from homeassistant.components.sensor import (
     SensorDeviceClass,
@@ -15,6 +14,7 @@ from homeassistant.components.sensor import (
 from homeassistant.config_entries import ConfigEntry
 from homeassistant.const import UnitOfEnergy
 from homeassistant.core import HomeAssistant, callback
+from homeassistant.exceptions import ConfigEntryAuthFailed
 from homeassistant.helpers.device_registry import DeviceInfo
 from homeassistant.helpers.update_coordinator import (
     CoordinatorEntity,
@@ -24,6 +24,14 @@ from homeassistant.helpers.update_coordinator import (
 from homeassistant.util import dt as dt_util
 
 from .const import DOMAIN
+from .glow_api import (
+    GlowApiClient,
+    GlowApiError,
+    GlowAuthError,
+    GlowConnectionError,
+    GlowTimeoutError,
+    TariffRates,
+)
 
 _LOGGER = logging.getLogger(__name__)
 
@@ -34,32 +42,29 @@ USAGE_CLASSIFIERS = ("electricity.consumption", "gas.consumption")
 COST_CLASSIFIERS = ("electricity.consumption.cost", "gas.consumption.cost")
 
 
-async def api_call(hass: HomeAssistant, func: Callable, description: str, *args):
-    """Run a blocking Glow API call, logging any failure consistently.
+async def api_call(coro: Coroutine, description: str):
+    """Await a Glow API call, logging any failure consistently.
 
-    Returns None if the call failed for any reason.
+    Returns None if the call failed for any transient reason. Raises
+    ConfigEntryAuthFailed if the stored credentials are rejected, so that
+    Home Assistant starts a re-authentication flow.
     """
     try:
-        result = await hass.async_add_executor_job(func, *args)
+        result = await coro
         _LOGGER.debug("Successful %s", description)
         return result
-    except requests.Timeout as ex:
+    except GlowAuthError as ex:
+        raise ConfigEntryAuthFailed(f"Authentication failed: {ex}") from ex
+    except GlowTimeoutError as ex:
         _LOGGER.error("Timeout during %s: %s", description, ex)
-    except requests.exceptions.ConnectionError as ex:
+    except GlowConnectionError as ex:
         _LOGGER.error("Cannot connect during %s: %s", description, ex)
-    # Can't use the RuntimeError exception from the library as it's not a subclass of Exception
-    except Exception as ex:  # pylint: disable=broad-except
-        if "Request failed" in str(ex):
-            _LOGGER.error(
-                "Non-200 Status Code during %s. The Glow API may be experiencing issues",
-                description,
-            )
-        else:
-            _LOGGER.exception(
-                "Unexpected exception during %s: %s. Please open an issue",
-                description,
-                ex,
-            )
+    except GlowApiError as ex:
+        _LOGGER.error(
+            "Error during %s: %s. The Glow API may be experiencing issues",
+            description,
+            ex,
+        )
     return None
 
 
@@ -70,16 +75,11 @@ async def async_setup_entry(
     entities: list = []
 
     # Get API object from the config flow
-    glowmarkt = hass.data[DOMAIN][entry.entry_id]
+    client: GlowApiClient = hass.data[DOMAIN][entry.entry_id]
 
     # Gather all virtual entities on the account
     virtual_entities = (
-        await api_call(
-            hass,
-            glowmarkt.get_virtual_entities,
-            f"GET to {glowmarkt.url}virtualentity",
-        )
-        or []
+        await api_call(client.get_virtual_entities(), "GET to virtualentity") or []
     )
 
     for virtual_entity in virtual_entities:
@@ -90,9 +90,8 @@ async def async_setup_entry(
         # Gather all resources for each virtual entity
         resources = (
             await api_call(
-                hass,
-                virtual_entity.get_resources,
-                f"GET to {glowmarkt.url}virtualentity/{virtual_entity.id}/resources",
+                client.get_resources(virtual_entity.id),
+                f"GET to virtualentity/{virtual_entity.id}/resources",
             )
             or []
         )
@@ -100,13 +99,13 @@ async def async_setup_entry(
         # Loop through all resources and create sensors
         for resource in resources:
             if resource.classifier in USAGE_CLASSIFIERS:
-                usage_sensor = Usage(hass, resource, virtual_entity)
+                usage_sensor = Usage(client, resource, virtual_entity)
                 entities.append(usage_sensor)
                 # Save the usage sensor as a meter so that the cost sensor can reference it
                 meters[resource.classifier] = usage_sensor
 
                 # Standing and Rate sensors share a single coordinator per resource
-                coordinator = TariffCoordinator(hass, entry, resource)
+                coordinator = TariffCoordinator(hass, entry, client, resource)
                 entities.append(Standing(coordinator, resource, virtual_entity))
                 entities.append(Rate(coordinator, resource, virtual_entity))
 
@@ -122,7 +121,7 @@ async def async_setup_entry(
                         resource.id,
                     )
                     continue
-                cost_sensor = Cost(hass, resource, virtual_entity)
+                cost_sensor = Cost(client, resource, virtual_entity)
                 cost_sensor.meter = meter
                 entities.append(cost_sensor)
 
@@ -160,7 +159,7 @@ def should_update() -> bool:
 
 
 async def daily_data(
-    hass: HomeAssistant, resource
+    client: GlowApiClient, resource
 ) -> tuple[float, datetime] | tuple[None, None]:
     """Get daily usage from the API.
 
@@ -177,25 +176,23 @@ async def daily_data(
     # Timezone-aware start of the day the readings cover
     day_start = dt_util.start_of_local_day(now.date())
     # Round to the day to set time to 00:00:00
-    t_from = await hass.async_add_executor_job(resource.round, now, "P1D")
+    t_from = now.replace(hour=0, minute=0, second=0, microsecond=0)
     # Round to the minute
-    t_to = await hass.async_add_executor_job(resource.round, now, "PT1M")
+    t_to = now.replace(second=0, microsecond=0)
 
-    # Tell Hildebrand to pull latest DCC data
-    await api_call(hass, resource.catchup, f"catchup for resource {resource.id}")
+    # Tell Hildebrand to pull latest DCC data. The DCC pull covers the whole
+    # meter, so the cost resources don't need to trigger it as well
+    if not resource.classifier.endswith(".cost"):
+        await api_call(
+            client.catchup(resource.id), f"catchup for resource {resource.id}"
+        )
 
     _LOGGER.debug(
         "Get readings from %s to %s for %s", t_from, t_to, resource.classifier
     )
     readings = await api_call(
-        hass,
-        resource.get_readings,
+        client.get_readings(resource.id, t_from, t_to, "P1D", "sum"),
         f"readings for resource {resource.id}",
-        t_from,
-        t_to,
-        "P1D",
-        "sum",
-        True,
     )
     if not readings:
         _LOGGER.debug("No readings returned for resource id %s", resource.id)
@@ -205,22 +202,39 @@ async def daily_data(
     total = 0.0
     # The API can split the requested day across two buckets around a DST change
     for reading in readings[:2]:
-        if reading[1] is not None and reading[1].value is not None:
-            total += reading[1].value
+        if reading[1] is not None:
+            total += reading[1]
     return total, day_start
 
 
-async def tariff_data(hass: HomeAssistant, resource):
-    """Get tariff data from the API."""
+async def tariff_data(client: GlowApiClient, resource) -> TariffRates | None:
+    """Get tariff data from the API.
+
+    Handled separately from api_call so that a transient failure isn't
+    reported as the account having no tariff data.
+    """
     try:
-        tariff = await hass.async_add_executor_job(resource.get_tariff)
-        _LOGGER.debug(
-            "Successful GET to https://api.glowmarkt.com/api/v0-1/resource/%s/tariff",
-            resource.id,
+        tariff = await client.get_tariff(resource.id)
+        _LOGGER.debug("Successful tariff fetch for resource %s", resource.id)
+    except GlowAuthError as ex:
+        raise ConfigEntryAuthFailed(f"Authentication failed: {ex}") from ex
+    except GlowTimeoutError as ex:
+        _LOGGER.error("Timeout fetching tariff for resource %s: %s", resource.id, ex)
+        return None
+    except GlowConnectionError as ex:
+        _LOGGER.error(
+            "Cannot connect fetching tariff for resource %s: %s", resource.id, ex
         )
-        return tariff
-    # pyglowmarkt raises UnboundLocalError when the API returns an empty tariff list
-    except (UnboundLocalError, KeyError, TypeError):
+        return None
+    except GlowApiError as ex:
+        _LOGGER.warning(
+            "Error fetching tariff for resource %s: %s. "
+            "The Glow API may be experiencing issues",
+            resource.id,
+            ex,
+        )
+        return None
+    if tariff is None:
         _LOGGER.warning(
             "No tariff data returned by the Glow API for the %s meter (id: %s). "
             "If you don't see tariff data for this meter in the Bright app, please "
@@ -228,19 +242,7 @@ async def tariff_data(hass: HomeAssistant, resource):
             supply_type(resource),
             resource.id,
         )
-    except requests.Timeout as ex:
-        _LOGGER.error("Timeout: %s", ex)
-    except requests.exceptions.ConnectionError as ex:
-        _LOGGER.error("Cannot connect: %s", ex)
-    # Can't use the RuntimeError exception from the library as it's not a subclass of Exception
-    except Exception as ex:  # pylint: disable=broad-except
-        if "Request failed" in str(ex):
-            _LOGGER.warning(
-                "Non-200 Status Code. The Glow API may be experiencing issues"
-            )
-        else:
-            _LOGGER.exception("Unexpected exception: %s. Please open an issue", ex)
-    return None
+    return tariff
 
 
 class Usage(SensorEntity):
@@ -252,11 +254,11 @@ class Usage(SensorEntity):
     _attr_native_unit_of_measurement = UnitOfEnergy.KILO_WATT_HOUR
     _attr_state_class = SensorStateClass.TOTAL_INCREASING
 
-    def __init__(self, hass: HomeAssistant, resource, virtual_entity) -> None:
+    def __init__(self, client: GlowApiClient, resource, virtual_entity) -> None:
         """Initialize the sensor."""
         self._attr_unique_id = resource.id
 
-        self.hass = hass
+        self.client = client
         self.initialised = False
         self.resource = resource
         self.virtual_entity = virtual_entity
@@ -284,7 +286,7 @@ class Usage(SensorEntity):
         # Get data on initial startup, then only when new data might be available
         if self.initialised and not should_update():
             return
-        value, _ = await daily_data(self.hass, self.resource)
+        value, _ = await daily_data(self.client, self.resource)
         if value is not None:
             self._attr_native_value = round(value, 2)
             self.initialised = True
@@ -301,11 +303,11 @@ class Cost(SensorEntity):
     # each day, so last_reset is published alongside it to mark the boundary.
     _attr_state_class = SensorStateClass.TOTAL
 
-    def __init__(self, hass: HomeAssistant, resource, virtual_entity) -> None:
+    def __init__(self, client: GlowApiClient, resource, virtual_entity) -> None:
         """Initialize the sensor."""
         self._attr_unique_id = resource.id
 
-        self.hass = hass
+        self.client = client
         self.initialised = False
         self.meter = None
         self.resource = resource
@@ -327,7 +329,7 @@ class Cost(SensorEntity):
         # Get data on initial startup, then only when new data might be available
         if self.initialised and not should_update():
             return
-        value, day_start = await daily_data(self.hass, self.resource)
+        value, day_start = await daily_data(self.client, self.resource)
         if value is not None:
             self._attr_native_value = round(value / 100, 2)
             self._attr_last_reset = day_start
@@ -337,7 +339,9 @@ class Cost(SensorEntity):
 class TariffCoordinator(DataUpdateCoordinator):
     """Data update coordinator for the tariff sensors."""
 
-    def __init__(self, hass: HomeAssistant, entry: ConfigEntry, resource) -> None:
+    def __init__(
+        self, hass: HomeAssistant, entry: ConfigEntry, client: GlowApiClient, resource
+    ) -> None:
         """Initialize tariff coordinator."""
         super().__init__(
             hass,
@@ -350,6 +354,7 @@ class TariffCoordinator(DataUpdateCoordinator):
             update_interval=TARIFF_SCAN_INTERVAL,
         )
 
+        self.client = client
         self.resource = resource
 
     async def _async_update_data(self):
@@ -359,7 +364,7 @@ class TariffCoordinator(DataUpdateCoordinator):
             # Return the previous value so the sensors keep their state
             return self.data
 
-        tariff = await tariff_data(self.hass, self.resource)
+        tariff = await tariff_data(self.client, self.resource)
         if tariff is None:
             if self.data is not None:
                 # A transient failure shouldn't wipe out a known good value
@@ -384,17 +389,16 @@ class BaseTariff(CoordinatorEntity, SensorEntity):
         self.virtual_entity = virtual_entity
 
     @staticmethod
-    def _extract(current_rates) -> float | None:
+    def _extract(rates: TariffRates) -> Any:
         """Return the raw pence value from the tariff's current rates."""
         raise NotImplementedError
 
     def _update_value(self) -> None:
         """Read the latest value from the coordinator without writing state."""
-        tariff = self.coordinator.data
-        current_rates = getattr(tariff, "current_rates", None)
-        if current_rates is None:
+        rates = self.coordinator.data
+        if rates is None:
             return
-        value = self._extract(current_rates)
+        value = self._extract(rates)
         if value is None:
             return
         try:
@@ -438,10 +442,9 @@ class Standing(BaseTariff):
         self._attr_unique_id = resource.id + "-tariff"
 
     @staticmethod
-    def _extract(current_rates) -> float | None:
+    def _extract(rates: TariffRates) -> Any:
         """Return the standing charge in pence."""
-        standing_charge = getattr(current_rates, "standing_charge", None)
-        return getattr(standing_charge, "value", None)
+        return rates.standing_charge
 
 
 class Rate(BaseTariff):
@@ -460,7 +463,6 @@ class Rate(BaseTariff):
         self._attr_unique_id = resource.id + "-rate"
 
     @staticmethod
-    def _extract(current_rates) -> float | None:
+    def _extract(rates: TariffRates) -> Any:
         """Return the unit rate in pence."""
-        rate = getattr(current_rates, "rate", None)
-        return getattr(rate, "value", None)
+        return rates.rate

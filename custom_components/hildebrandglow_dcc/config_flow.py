@@ -5,15 +5,15 @@ from collections.abc import Mapping
 import logging
 from typing import Any
 
-from glowmarkt import BrightClient
-import requests
 import voluptuous as vol
 
 from homeassistant import config_entries
 from homeassistant.config_entries import ConfigFlowResult
 from homeassistant.core import HomeAssistant
+from homeassistant.helpers.aiohttp_client import async_get_clientsession
 
 from .const import DOMAIN
+from .glow_api import GlowApiClient, GlowAuthError, GlowConnectionError, GlowTimeoutError
 
 _LOGGER = logging.getLogger(__name__)
 
@@ -36,29 +36,25 @@ async def validate_input(hass: HomeAssistant, data: dict[str, Any]) -> dict[str,
 
     Data has the keys from STEP_USER_DATA_SCHEMA with values provided by the user.
     """
-    glowmarkt = await hass.async_add_executor_job(
-        BrightClient, data["username"], data["password"]
+    client = GlowApiClient(
+        async_get_clientsession(hass), data["username"], data["password"]
     )
-    _LOGGER.debug("Successful Post to %sauth", glowmarkt.url)
+    await client.authenticate()
 
     # Return title of the entry to be added
     return {"title": "Hildebrand Glow (DCC)"}
 
 
 def _error_key(ex: Exception) -> str:
-    """Map an exception raised by the library onto a config flow error key."""
-    if isinstance(ex, requests.Timeout):
+    """Map an exception raised by the API client onto a config flow error key."""
+    if isinstance(ex, GlowTimeoutError):
         _LOGGER.debug("Timeout: %s", ex)
         return "timeout_connect"
-    if isinstance(ex, requests.exceptions.ConnectionError):
+    if isinstance(ex, GlowConnectionError):
         _LOGGER.debug("Cannot connect: %s", ex)
         return "cannot_connect"
-    # Can't use the RuntimeError exception from the library as it's not a subclass of Exception
-    if "Authentication failed" in str(ex):
-        _LOGGER.debug("Authentication Failed")
-        return "invalid_auth"
-    if "Expected an authentication token" in str(ex):
-        _LOGGER.debug("Expected an authentication token but didn't get one")
+    if isinstance(ex, GlowAuthError):
+        _LOGGER.debug("Authentication failed: %s", ex)
         return "invalid_auth"
     _LOGGER.exception("Unexpected exception: %s", ex)
     return "unknown"
