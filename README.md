@@ -54,6 +54,19 @@ Once you've authenticated, the integration will automatically set up the followi
 - Cost (Today) - Total cost of today's consumption (GBP)
 - Standing Charge - Current standing charge (GBP)
 - Rate - Current tariff (GBP/kWh)
+- Last reading - Time of the newest reading the Glow platform holds for the meter, with the start of the available history and the resource details as attributes (diagnostic)
+- Tariff - Name of the tariff currently applied to the meter, with the rate, standing charge and full tariff history as attributes (diagnostic; only created when the API holds tariff history for the meter)
+- Meter point - One sensor per MPAN/MPRN on the account showing the meter point number, with the verification status, consent expiry date and the DCC inventory (meter manufacturer, model, firmware, serial/EUI, SMETS version) as attributes (diagnostic)
+
+Where the API can report it, the meter's own identifying number is also recorded as the serial number on the meter's device in Home Assistant's device registry.
+
+If your account has Glow hardware (an IHD/CAD), the integration detects this automatically at startup and creates these additional entities:
+
+- Power (now) - Live electricity power draw in watts, polled once a minute. Marked unavailable if the hardware stops reporting for more than 10 minutes.
+- Meter reading - The cumulative register reading as shown on the meter itself (kWh, or m³ for volume-based gas registers)
+- Connectivity - A binary sensor per gateway device showing whether it is still sending data to the Glow platform, with the last-seen time as an attribute (diagnostic)
+
+Accounts without Glow hardware simply don't get the hardware entities; the endpoints are probed once at startup and skipped silently if unsupported.
 
 The usage and cost sensors will still show the previous day's data until shortly after 01:30 to ensure that all of the previous day's data is collected.
 
@@ -64,10 +77,18 @@ If the data being shown is wrong, check the Bright app first. If it is also wron
 Hildebrand's DCC backend only publishes new smart meter readings roughly twice an hour, so all sensors are refreshed on the same cadence rather than continuously:
 
 - Home Assistant polls the integration every 5 minutes, but a new API request is only actually made when the clock is between :00-:05 or :30-:35 past the hour. Outside of those windows, the sensors keep their last known value.
-- This applies to all four sensors: Usage, Cost, Standing Charge and Rate. The two tariff sensors (Standing Charge and Rate) share a single update per resource, driven by a single coordinator, so they always update together.
+- This applies to the four DCC-sourced sensors: Usage, Cost, Standing Charge and Rate. The two tariff sensors (Standing Charge and Rate) share a single update per resource, driven by a single coordinator, so they always update together.
+- The hardware-sourced entities are not tied to the half-hourly DCC cadence: Power (now) and Connectivity refresh every minute, while Meter reading and Last reading refresh every 5 minutes.
 - In practice this means you should expect each sensor's value (and its "last updated" time) to change shortly after each half hour, not every 5 minutes.
-- The Glow API access token expires after 7 days. The integration renews it automatically ahead of expiry, so no restart is needed to keep data flowing.
-- If a sensor hasn't updated for longer than about 35 minutes, first check that the data is up to date in the Bright app, then enable [debug logging](#debugging) and look for errors from the integration.
+- The Glow API access token expires after 7 days. The integration renews it automatically ahead of expiry — by exchanging the current token for a fresh one where possible, falling back to your stored credentials — so no restart is needed to keep data flowing.
+- If a sensor hasn't updated for longer than about 35 minutes, first check that the data is up to date in the Bright app, then try the `hildebrandglow_dcc.catchup` and `hildebrandglow_dcc.clear_cache` [services](#services), and finally enable [debug logging](#debugging) and look for errors from the integration.
+
+## Services
+
+Two services are provided for when the data looks stale or wrong. Both accept a device target, or no target at all to cover every meter on the account:
+
+- `hildebrandglow_dcc.catchup` - Asks the Glow platform to pull the latest available readings from the DCC. The integration already does this on its normal update cycle; the service is for forcing it by hand or from an automation.
+- `hildebrandglow_dcc.clear_cache` - Drops the Glow platform's cached data for the meter, so the next request is answered from the underlying data.
 
 ## Energy Management
 

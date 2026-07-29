@@ -9,12 +9,19 @@ from homeassistant.core import HomeAssistant
 from homeassistant.exceptions import ConfigEntryAuthFailed, ConfigEntryNotReady
 from homeassistant.helpers.aiohttp_client import async_get_clientsession
 
-from .const import DOMAIN
+from .const import (
+    DATA_CLIENT,
+    DATA_RESOURCES,
+    DOMAIN,
+    SERVICE_CATCHUP,
+    SERVICE_CLEAR_CACHE,
+)
 from .glow_api import GlowApiClient, GlowAuthError, GlowError
+from .services import async_register_services
 
 _LOGGER = logging.getLogger(__name__)
 
-PLATFORMS: list[Platform] = [Platform.SENSOR]
+PLATFORMS: list[Platform] = [Platform.BINARY_SENSOR, Platform.SENSOR]
 
 
 async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
@@ -36,10 +43,16 @@ async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
     except GlowError as ex:
         raise ConfigEntryNotReady(str(ex)) from ex
 
-    # Set API object
-    hass.data[DOMAIN][entry.entry_id] = client
+    # Set API object. The resource IDs are filled in by the sensor platform
+    # as it discovers the meters, and are what the services act on
+    hass.data[DOMAIN][entry.entry_id] = {
+        DATA_CLIENT: client,
+        DATA_RESOURCES: set(),
+    }
 
     await hass.config_entries.async_forward_entry_setups(entry, PLATFORMS)
+
+    await async_register_services(hass)
 
     return True
 
@@ -48,5 +61,8 @@ async def async_unload_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
     """Unload a config entry."""
     if unload_ok := await hass.config_entries.async_unload_platforms(entry, PLATFORMS):
         hass.data[DOMAIN].pop(entry.entry_id, None)
+        if not hass.data[DOMAIN]:
+            for service in (SERVICE_CATCHUP, SERVICE_CLEAR_CACHE):
+                hass.services.async_remove(DOMAIN, service)
 
     return unload_ok

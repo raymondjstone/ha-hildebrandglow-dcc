@@ -1,7 +1,7 @@
 """Platform for sensor integration."""
 from __future__ import annotations
 
-from collections.abc import Callable, Coroutine
+from collections.abc import Callable
 from datetime import datetime, time, timedelta
 import logging
 from typing import Any
@@ -12,7 +12,7 @@ from homeassistant.components.sensor import (
     SensorStateClass,
 )
 from homeassistant.config_entries import ConfigEntry
-from homeassistant.const import UnitOfEnergy
+from homeassistant.const import EntityCategory, UnitOfEnergy, UnitOfPower, UnitOfVolume
 from homeassistant.core import HomeAssistant, callback
 from homeassistant.exceptions import ConfigEntryAuthFailed
 from homeassistant.helpers.device_registry import DeviceInfo
@@ -23,7 +23,7 @@ from homeassistant.helpers.update_coordinator import (
 )
 from homeassistant.util import dt as dt_util
 
-from .const import DOMAIN
+from .const import DATA_CLIENT, DATA_RESOURCES, DOMAIN
 from .glow_api import (
     GlowApiClient,
     GlowApiError,
@@ -32,40 +32,21 @@ from .glow_api import (
     GlowTimeoutError,
     TariffRates,
 )
+from .helpers import api_call, probe_call
 
 _LOGGER = logging.getLogger(__name__)
 
 SCAN_INTERVAL = timedelta(minutes=5)
 TARIFF_SCAN_INTERVAL = timedelta(minutes=5)
+# The CAD pushes new instantaneous readings every few seconds, but polling a
+# cloud API that fast would hammer it; once a minute is a fair compromise
+POWER_SCAN_INTERVAL = timedelta(seconds=60)
+# If the CAD stops reporting, /current keeps echoing its last value. Mark the
+# power sensor unavailable rather than showing a stale figure forever
+POWER_STALE_AFTER = timedelta(minutes=10)
 
 USAGE_CLASSIFIERS = ("electricity.consumption", "gas.consumption")
 COST_CLASSIFIERS = ("electricity.consumption.cost", "gas.consumption.cost")
-
-
-async def api_call(coro: Coroutine, description: str):
-    """Await a Glow API call, logging any failure consistently.
-
-    Returns None if the call failed for any transient reason. Raises
-    ConfigEntryAuthFailed if the stored credentials are rejected, so that
-    Home Assistant starts a re-authentication flow.
-    """
-    try:
-        result = await coro
-        _LOGGER.debug("Successful %s", description)
-        return result
-    except GlowAuthError as ex:
-        raise ConfigEntryAuthFailed(f"Authentication failed: {ex}") from ex
-    except GlowTimeoutError as ex:
-        _LOGGER.error("Timeout during %s: %s", description, ex)
-    except GlowConnectionError as ex:
-        _LOGGER.error("Cannot connect during %s: %s", description, ex)
-    except GlowApiError as ex:
-        _LOGGER.error(
-            "Error during %s: %s. The Glow API may be experiencing issues",
-            description,
-            ex,
-        )
-    return None
 
 
 async def async_setup_entry(
@@ -73,9 +54,12 @@ async def async_setup_entry(
 ) -> bool:
     """Set up the sensor platform."""
     entities: list = []
+    # Usage sensors across every virtual entity, for meter point matching
+    all_usage_sensors: list[Usage] = []
 
     # Get API object from the config flow
-    client: GlowApiClient = hass.data[DOMAIN][entry.entry_id]
+    entry_data = hass.data[DOMAIN][entry.entry_id]
+    client: GlowApiClient = entry_data[DATA_CLIENT]
 
     # Gather all virtual entities on the account
     virtual_entities = (
@@ -98,16 +82,42 @@ async def async_setup_entry(
 
         # Loop through all resources and create sensors
         for resource in resources:
+            if resource.active is False:
+                _LOGGER.debug(
+                    "Resource %s (%s) is marked inactive by the API; its "
+                    "sensors may not receive data",
+                    resource.id,
+                    resource.classifier,
+                )
             if resource.classifier in USAGE_CLASSIFIERS:
+                # Let the services act on this meter
+                entry_data[DATA_RESOURCES].add(resource.id)
                 usage_sensor = Usage(client, resource, virtual_entity)
                 entities.append(usage_sensor)
+                all_usage_sensors.append(usage_sensor)
                 # Save the usage sensor as a meter so that the cost sensor can reference it
                 meters[resource.classifier] = usage_sensor
+
+                # Record the meter's own number on the device when the API
+                # can report which physical meter sources this resource
+                meter_device = await probe_call(
+                    client.get_device_for_resource(resource.id),
+                    f"device probe for resource {resource.id}",
+                )
+                if meter_device is not None and meter_device.hardware_id:
+                    usage_sensor.serial_number = meter_device.hardware_id
 
                 # Standing and Rate sensors share a single coordinator per resource
                 coordinator = TariffCoordinator(hass, entry, client, resource)
                 entities.append(Standing(coordinator, resource, virtual_entity))
                 entities.append(Rate(coordinator, resource, virtual_entity))
+
+                # The remaining sensors need Glow hardware (IHD/CAD) on the
+                # account, so probe each endpoint once and only create the
+                # sensor if the account supports it
+                entities.extend(
+                    await hardware_sensors(hass, entry, client, resource, virtual_entity)
+                )
 
         # Cost sensors must be created after usage sensors as they reference them as a meter
         for resource in resources:
@@ -125,10 +135,90 @@ async def async_setup_entry(
                 cost_sensor.meter = meter
                 entities.append(cost_sensor)
 
+                # Tariff history is documented against the cost resource.
+                # Not every account has it, so probe once at setup
+                history = await probe_call(
+                    client.get_tariff_list(resource.id),
+                    f"tariff list probe for resource {resource.id}",
+                )
+                if history:
+                    entities.append(
+                        TariffHistory(client, resource, meter, virtual_entity, history)
+                    )
+                else:
+                    _LOGGER.debug(
+                        "No tariff history for resource %s; skipping the "
+                        "tariff sensor",
+                        resource.id,
+                    )
+
+    # Meter points (MPAN/MPRN) are account-wide, so handle them after all
+    # virtual entities have been walked
+    entities.extend(await meter_point_sensors(client, all_usage_sensors))
+
     # Get data for all entities on initial startup
     async_add_entities(entities, update_before_add=True)
 
     return True
+
+
+async def meter_point_sensors(
+    client: GlowApiClient, usage_sensors: list[Usage]
+) -> list[SensorEntity]:
+    """Create a diagnostic sensor for each meter point on the account.
+
+    Each sensor carries the meter point number (MPAN/MPRN), its verification
+    and consent state, and the DCC inventory of the devices behind it. All
+    endpoints are probed, so accounts where they fail just get no sensors.
+    """
+    sensors: list[SensorEntity] = []
+    meter_points = (
+        await probe_call(client.get_meter_points(), "meter point verification probe")
+        or []
+    )
+
+    for point in meter_points:
+        # Attach to the right meter's device via the API's own mapping of
+        # meter point to resources, falling back to the supply type when
+        # the account only has one meter of that kind
+        resource_ids = (
+            await probe_call(
+                client.get_meter_point_resources(point.mpxn),
+                f"resources probe for meter point {point.mpxn}",
+            )
+            or []
+        )
+        meter = next(
+            (u for u in usage_sensors if u.resource.id in resource_ids), None
+        )
+        if meter is None:
+            supply = "electricity" if point.kind == "mpan" else "gas"
+            candidates = [
+                u for u in usage_sensors if supply_type(u.resource) == supply
+            ]
+            if len(candidates) == 1:
+                meter = candidates[0]
+
+        inventory = (
+            await probe_call(
+                client.get_meter_point_inventory(point.mpxn),
+                f"inventory probe for meter point {point.mpxn}",
+            )
+            or []
+        )
+
+        # The inventory can also supply the meter's number if the device
+        # lookup couldn't
+        if meter is not None and meter.serial_number is None:
+            wanted = "ESME" if point.kind == "mpan" else "GSME"
+            for entry in inventory:
+                if entry.get("DeviceType") == wanted and entry.get("EUI"):
+                    meter.serial_number = str(entry["EUI"])
+                    break
+
+        sensors.append(MeterPointSensor(client, point, inventory, meter))
+
+    return sensors
 
 
 def supply_type(resource) -> str:
@@ -245,6 +335,75 @@ async def tariff_data(client: GlowApiClient, resource) -> TariffRates | None:
     return tariff
 
 
+async def hardware_sensors(
+    hass: HomeAssistant,
+    entry: ConfigEntry,
+    client: GlowApiClient,
+    resource,
+    virtual_entity,
+) -> list[SensorEntity]:
+    """Create the sensors that rely on Glow hardware (IHD/CAD).
+
+    Each endpoint is probed once; accounts without hardware simply don't get
+    these sensors and no errors are logged.
+    """
+    sensors: list[SensorEntity] = []
+
+    # Live power draw, electricity only. Without a CAD the endpoint echoes
+    # the latest stored kWh reading instead, so require the unit to be watts
+    if resource.classifier == "electricity.consumption":
+        current = await probe_call(
+            client.get_current(resource.id),
+            f"current reading probe for resource {resource.id}",
+        )
+        if current is not None and current.units in (None, "W"):
+            coordinator = PowerCoordinator(hass, entry, client, resource)
+            # Seed the coordinator so the sensor has a value straight away
+            coordinator.async_set_updated_data(current)
+            sensors.append(Power(coordinator, resource, virtual_entity))
+        else:
+            _LOGGER.debug(
+                "No live power data for resource %s (units: %s); "
+                "skipping the power sensor",
+                resource.id,
+                getattr(current, "units", None),
+            )
+
+    # Cumulative meter register, only reported when the account has an IHD/CAD
+    meter_read = await probe_call(
+        client.get_meter_read(resource.id),
+        f"meter read probe for resource {resource.id}",
+    )
+    if meter_read is not None:
+        sensors.append(
+            MeterReading(client, resource, virtual_entity, meter_read)
+        )
+    else:
+        _LOGGER.debug(
+            "No meter register data for resource %s; skipping the meter "
+            "reading sensor",
+            resource.id,
+        )
+
+    # Time of the newest available reading; works for DCC-only accounts too
+    last_time = await probe_call(
+        client.get_last_time(resource.id),
+        f"last-time probe for resource {resource.id}",
+    )
+    if last_time is not None:
+        # How far back the platform holds history. This never moves, so it is
+        # fetched once here and carried as an attribute
+        first_time = await probe_call(
+            client.get_first_time(resource.id),
+            f"first-time probe for resource {resource.id}",
+        )
+        sensors.append(
+            LastReading(client, resource, virtual_entity, last_time, first_time)
+        )
+
+    return sensors
+
+
 class Usage(SensorEntity):
     """Sensor object for daily usage."""
 
@@ -261,6 +420,10 @@ class Usage(SensorEntity):
         self.client = client
         self.initialised = False
         self.resource = resource
+        # The meter's own identifying number, filled in during setup when the
+        # API can report it. The device registry merges it into the device
+        # shared by all of this meter's sensors
+        self.serial_number: str | None = None
         self.virtual_entity = virtual_entity
 
     @property
@@ -271,6 +434,7 @@ class Usage(SensorEntity):
             manufacturer="Hildebrand",
             model="Glow (DCC)",
             name=device_name(self.resource, self.virtual_entity),
+            serial_number=self.serial_number,
         )
 
     @property
@@ -466,3 +630,351 @@ class Rate(BaseTariff):
     def _extract(rates: TariffRates) -> Any:
         """Return the unit rate in pence."""
         return rates.rate
+
+
+class PowerCoordinator(DataUpdateCoordinator):
+    """Data update coordinator for the live power sensor."""
+
+    def __init__(
+        self, hass: HomeAssistant, entry: ConfigEntry, client: GlowApiClient, resource
+    ) -> None:
+        """Initialize the power coordinator."""
+        super().__init__(
+            hass,
+            _LOGGER,
+            config_entry=entry,
+            name="power",
+            update_interval=POWER_SCAN_INTERVAL,
+        )
+
+        self.client = client
+        self.resource = resource
+
+    async def _async_update_data(self):
+        """Fetch the latest instantaneous reading."""
+        reading = await api_call(
+            self.client.get_current(self.resource.id),
+            f"current reading for resource {self.resource.id}",
+        )
+        if reading is None:
+            if self.data is not None:
+                # A transient failure shouldn't wipe out a known good value;
+                # staleness is handled by the sensor's availability check
+                return self.data
+            raise UpdateFailed(
+                f"No current reading available for resource {self.resource.id}"
+            )
+        return reading
+
+
+class Power(CoordinatorEntity, SensorEntity):
+    """Sensor for the live power draw, sourced from Glow hardware (CAD)."""
+
+    _attr_device_class = SensorDeviceClass.POWER
+    _attr_has_entity_name = True
+    _attr_name = "Power (now)"
+    _attr_native_unit_of_measurement = UnitOfPower.WATT
+    _attr_state_class = SensorStateClass.MEASUREMENT
+
+    def __init__(self, coordinator, resource, virtual_entity) -> None:
+        """Initialize the power sensor."""
+        super().__init__(coordinator)
+
+        self._attr_unique_id = resource.id + "-power"
+        self.resource = resource
+        self.virtual_entity = virtual_entity
+
+    @property
+    def device_info(self) -> DeviceInfo:
+        """Return device information."""
+        return DeviceInfo(
+            identifiers={(DOMAIN, self.resource.id)},
+            manufacturer="Hildebrand",
+            model="Glow (DCC)",
+            name=device_name(self.resource, self.virtual_entity),
+        )
+
+    @property
+    def available(self) -> bool:
+        """Consider the sensor unavailable once the reading goes stale."""
+        reading = self.coordinator.data
+        return (
+            super().available
+            and reading is not None
+            and dt_util.utcnow() - reading.timestamp < POWER_STALE_AFTER
+        )
+
+    @property
+    def native_value(self) -> float | None:
+        """Return the latest power reading in watts."""
+        reading = self.coordinator.data
+        return reading.value if reading is not None else None
+
+
+class MeterReading(SensorEntity):
+    """Sensor for the cumulative register reading of the meter itself."""
+
+    _attr_has_entity_name = True
+    _attr_icon = "mdi:counter"
+    _attr_name = "Meter reading"
+    _attr_state_class = SensorStateClass.TOTAL_INCREASING
+    _attr_suggested_display_precision = 3
+
+    def __init__(self, client: GlowApiClient, resource, virtual_entity, initial) -> None:
+        """Initialize the sensor from the reading probed during setup."""
+        self._attr_unique_id = resource.id + "-meterread"
+
+        self.client = client
+        self.resource = resource
+        self.virtual_entity = virtual_entity
+
+        # The API reports the unit alongside the value; gas registers can be
+        # volume (m3) rather than energy depending on the meter
+        if initial.units in ("m3", "m³"):
+            self._attr_device_class = SensorDeviceClass.GAS
+            self._attr_native_unit_of_measurement = UnitOfVolume.CUBIC_METERS
+        else:
+            self._attr_device_class = SensorDeviceClass.ENERGY
+            self._attr_native_unit_of_measurement = UnitOfEnergy.KILO_WATT_HOUR
+        self._attr_native_value = initial.value
+
+    @property
+    def device_info(self) -> DeviceInfo:
+        """Return device information."""
+        return DeviceInfo(
+            identifiers={(DOMAIN, self.resource.id)},
+            manufacturer="Hildebrand",
+            model="Glow (DCC)",
+            name=device_name(self.resource, self.virtual_entity),
+        )
+
+    async def async_update(self) -> None:
+        """Fetch the latest register reading."""
+        reading = await api_call(
+            self.client.get_meter_read(self.resource.id),
+            f"meter read for resource {self.resource.id}",
+        )
+        if reading is not None:
+            self._attr_native_value = reading.value
+
+
+class TariffHistory(SensorEntity):
+    """Diagnostic sensor showing the tariff currently in effect.
+
+    The state is the tariff's name and the full history, sorted oldest
+    first, is exposed through the attributes with rates converted to GBP.
+    """
+
+    _attr_entity_category = EntityCategory.DIAGNOSTIC
+    _attr_has_entity_name = True
+    _attr_icon = "mdi:script-text-outline"
+    _attr_name = "Tariff"
+
+    def __init__(
+        self, client: GlowApiClient, resource, meter, virtual_entity, history
+    ) -> None:
+        """Initialize the sensor from the history probed during setup."""
+        self._attr_unique_id = resource.id + "-tariff-history"
+
+        self.client = client
+        self.initialised = False
+        self.meter = meter
+        self.resource = resource
+        self.virtual_entity = virtual_entity
+        self._apply(history)
+
+    @property
+    def device_info(self) -> DeviceInfo:
+        """Return device information."""
+        return DeviceInfo(
+            # Attach to the same device as the meter's other sensors
+            identifiers={(DOMAIN, self.meter.resource.id)},
+            manufacturer="Hildebrand",
+            model="Glow (DCC)",
+            name=device_name(self.resource, self.virtual_entity),
+        )
+
+    @staticmethod
+    def _pounds(pence) -> float | None:
+        """Convert a pence value from the API to GBP."""
+        try:
+            return round(float(pence) / 100, 4)
+        except (TypeError, ValueError):
+            return None
+
+    def _apply(self, history) -> None:
+        """Set the state and attributes from a sorted tariff history."""
+        now = dt_util.utcnow()
+        current = None
+        for entry in history:
+            if entry.effective_from is None or entry.effective_from <= now:
+                current = entry
+        # If every effective date is in the future, fall back to the newest
+        if current is None:
+            current = history[-1]
+
+        self._attr_native_value = current.name
+        self._attr_extra_state_attributes = {
+            "effective_from": current.effective_from,
+            "rate": self._pounds(current.rate),
+            "standing_charge": self._pounds(current.standing_charge),
+            "history": [
+                {
+                    "name": entry.name,
+                    "effective_from": entry.effective_from,
+                    "rate": self._pounds(entry.rate),
+                    "standing_charge": self._pounds(entry.standing_charge),
+                }
+                for entry in history
+            ],
+        }
+
+    async def async_update(self) -> None:
+        """Fetch the latest tariff history."""
+        # Tariff changes are rare; stick to the shared half-hourly cadence
+        if self.initialised and not should_update():
+            return
+        history = await api_call(
+            self.client.get_tariff_list(self.resource.id),
+            f"tariff list for resource {self.resource.id}",
+        )
+        if history:
+            self._apply(history)
+            self.initialised = True
+
+
+class MeterPointSensor(SensorEntity):
+    """Diagnostic sensor for a meter point (MPAN/MPRN).
+
+    The state is the meter point number. Verification status, consent
+    expiry and the DCC inventory of the devices behind the meter point are
+    exposed through the attributes.
+    """
+
+    _attr_entity_category = EntityCategory.DIAGNOSTIC
+    _attr_has_entity_name = True
+
+    def __init__(self, client: GlowApiClient, point, inventory: list, meter) -> None:
+        """Initialize the sensor from the data probed during setup."""
+        self._attr_unique_id = f"meterpoint-{point.mpxn}"
+        self._attr_name = f"Meter point ({point.kind.upper()})"
+        self._attr_icon = (
+            "mdi:meter-electric-outline"
+            if point.kind == "mpan"
+            else "mdi:meter-gas-outline"
+        )
+        self._attr_native_value = point.mpxn
+
+        self.client = client
+        self.initialised = False
+        self.inventory = inventory
+        self.meter = meter
+        self.point = point
+        self._build_attributes()
+
+    @property
+    def device_info(self) -> DeviceInfo:
+        """Return device information."""
+        if self.meter is not None:
+            # Attach to the same device as the meter's other sensors
+            return DeviceInfo(
+                identifiers={(DOMAIN, self.meter.resource.id)},
+                manufacturer="Hildebrand",
+                model="Glow (DCC)",
+                name=device_name(self.meter.resource, self.meter.virtual_entity),
+            )
+        return DeviceInfo(
+            identifiers={(DOMAIN, f"meterpoint-{self.point.mpxn}")},
+            manufacturer="Hildebrand",
+            model="Glow (DCC)",
+            name=f"Meter point {self.point.mpxn}",
+        )
+
+    def _build_attributes(self) -> None:
+        """Assemble the attributes from the meter point and its inventory."""
+        self._attr_extra_state_attributes = {
+            "type": self.point.kind.upper(),
+            "verified": self.point.is_verified,
+            "consent_valid_until": self.point.valid_until,
+            "inventory": [
+                {
+                    "device_type": entry.get("DeviceType"),
+                    "manufacturer": entry.get("DeviceManufacturer"),
+                    "model": entry.get("DeviceModel"),
+                    "firmware_version": entry.get("DeviceFirmwareVersion"),
+                    "status": entry.get("DeviceStatus"),
+                    "eui": entry.get("EUI"),
+                    "smets_version": entry.get("SmetsVersion"),
+                    "date_commissioned": entry.get("DateCommissioned"),
+                }
+                for entry in self.inventory
+            ],
+        }
+
+    async def async_update(self) -> None:
+        """Refresh the verification and consent state of the meter point."""
+        # Consent changes are rare; stick to the shared half-hourly cadence.
+        # The inventory is fixed hardware data, fetched once at setup
+        if self.initialised and not should_update():
+            return
+        meter_points = await api_call(
+            self.client.get_meter_points(), "meter point verification"
+        )
+        if meter_points is None:
+            return
+        for point in meter_points:
+            if point.mpxn == self.point.mpxn:
+                self.point = point
+                self._build_attributes()
+                self.initialised = True
+                return
+
+
+class LastReading(SensorEntity):
+    """Diagnostic sensor for the time of the newest available reading."""
+
+    _attr_device_class = SensorDeviceClass.TIMESTAMP
+    _attr_entity_category = EntityCategory.DIAGNOSTIC
+    _attr_has_entity_name = True
+    _attr_name = "Last reading"
+
+    def __init__(
+        self,
+        client: GlowApiClient,
+        resource,
+        virtual_entity,
+        initial: datetime,
+        first_reading: datetime | None = None,
+    ) -> None:
+        """Initialize the sensor from the timestamps probed during setup."""
+        self._attr_unique_id = resource.id + "-last-time"
+        self._attr_native_value = initial
+        self._attr_extra_state_attributes = {
+            "data_available_from": first_reading,
+            "resource_id": resource.id,
+            "classifier": resource.classifier,
+            "description": resource.description,
+        }
+
+        self.client = client
+        self.resource = resource
+        self.virtual_entity = virtual_entity
+
+    @property
+    def device_info(self) -> DeviceInfo:
+        """Return device information."""
+        return DeviceInfo(
+            identifiers={(DOMAIN, self.resource.id)},
+            manufacturer="Hildebrand",
+            model="Glow (DCC)",
+            name=device_name(self.resource, self.virtual_entity),
+        )
+
+    async def async_update(self) -> None:
+        """Fetch the time of the most recent reading."""
+        last_time = await api_call(
+            self.client.get_last_time(self.resource.id),
+            f"last-time for resource {self.resource.id}",
+        )
+        if last_time is not None:
+            self._attr_native_value = last_time
