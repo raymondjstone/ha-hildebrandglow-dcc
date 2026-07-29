@@ -45,7 +45,16 @@ class GlowTimeoutError(GlowConnectionError):
 
 
 class GlowApiError(GlowError):
-    """The API returned an unexpected response."""
+    """The API returned an unexpected response.
+
+    The HTTP status is kept so that callers can tell an endpoint that this
+    account does not support from one that merely failed this time.
+    """
+
+    def __init__(self, message: str, status: int | None = None) -> None:
+        """Store the message along with the status that produced it."""
+        super().__init__(message)
+        self.status = status
 
 
 @dataclass
@@ -354,7 +363,10 @@ class GlowApiClient:
                     await self._authenticate()
                 resp = await self._send(method, path, params)
             if resp.status != 200:
-                raise GlowApiError(f"{method} {path} returned status {resp.status}")
+                raise GlowApiError(
+                    f"{method} {path} returned status {resp.status}",
+                    status=resp.status,
+                )
             return await resp.json()
         except TimeoutError as ex:
             raise GlowTimeoutError(f"Timeout during {method} {path}") from ex

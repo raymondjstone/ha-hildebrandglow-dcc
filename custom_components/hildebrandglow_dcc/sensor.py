@@ -175,21 +175,16 @@ async def async_setup_entry(
                 entities.append(cost_sensor)
 
                 # Tariff history is documented against the cost resource.
-                # Not every account has it, so probe once at setup
+                # As with the other diagnostics, the sensor is created even
+                # if the probe comes back empty, so that a failure at
+                # startup costs an update rather than the whole entity
                 history = await probe_call(
                     client.get_tariff_list(resource.id),
                     f"tariff list probe for resource {resource.id}",
                 )
-                if history:
-                    entities.append(
-                        TariffHistory(client, resource, meter, virtual_entity, history)
-                    )
-                else:
-                    _LOGGER.debug(
-                        "No tariff history for resource %s; skipping the "
-                        "tariff sensor",
-                        resource.id,
-                    )
+                entities.append(
+                    TariffHistory(client, resource, meter, virtual_entity, history)
+                )
 
     # Meter points (MPAN/MPRN) are account-wide, so handle them after all
     # virtual entities have been walked
@@ -439,21 +434,23 @@ async def hardware_sensors(
             resource.id,
         )
 
-    # Time of the newest available reading; works for DCC-only accounts too
+    # Time of the newest available reading. This works on every account, so
+    # the sensor is always created: if the probe fails it simply starts out
+    # unknown and fills in on its next update, rather than disappearing
+    # until Home Assistant is restarted
     last_time = await probe_call(
         client.get_last_time(resource.id),
         f"last-time probe for resource {resource.id}",
     )
-    if last_time is not None:
-        # How far back the platform holds history. This never moves, so it is
-        # fetched once here and carried as an attribute
-        first_time = await probe_call(
-            client.get_first_time(resource.id),
-            f"first-time probe for resource {resource.id}",
-        )
-        sensors.append(
-            LastReading(client, resource, virtual_entity, last_time, first_time)
-        )
+    # How far back the platform holds history. This never moves, so it is
+    # fetched once here and carried as an attribute
+    first_time = await probe_call(
+        client.get_first_time(resource.id),
+        f"first-time probe for resource {resource.id}",
+    )
+    sensors.append(
+        LastReading(client, resource, virtual_entity, last_time, first_time)
+    )
 
     return sensors
 
@@ -795,7 +792,12 @@ class Power(CoordinatorEntity, SensorEntity):
 
 
 class MeterReading(SensorEntity):
-    """Sensor for the cumulative register reading of the meter itself."""
+    """Sensor for the cumulative register reading of the meter itself.
+
+    On a dual-rate meter, such as Economy 7, the API reports the combined
+    total of the day and night registers, so the value will not match
+    either of the figures the meter displays individually.
+    """
 
     _attr_has_entity_name = True
     _attr_icon = "mdi:counter"
@@ -923,6 +925,12 @@ class TariffHistory(SensorEntity):
 
     def _apply(self, history) -> None:
         """Set the state and attributes from a sorted tariff history."""
+        if not history:
+            # Nothing to show yet; the next update will fill this in
+            self._attr_native_value = None
+            self._attr_extra_state_attributes = {}
+            return
+
         now = dt_util.utcnow()
         current = None
         for entry in history:
@@ -1062,7 +1070,7 @@ class LastReading(SensorEntity):
         client: GlowApiClient,
         resource,
         virtual_entity,
-        initial: datetime,
+        initial: datetime | None,
         first_reading: datetime | None = None,
     ) -> None:
         """Initialize the sensor from the timestamps probed during setup."""
