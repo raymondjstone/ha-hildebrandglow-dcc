@@ -1,0 +1,18 @@
+catchup:
+  name: Catch up
+  description: >-
+    Ask the Glow platform to pull the latest available readings from the DCC.
+    Leave the target empty to cover every meter on the account.
+  target:
+    device:
+      integration: hildebrandglow_dcc
+
+clear_cache:
+  name: Clear cache
+  description: >-
+    Drop the Glow platform's cached data for the meter, so the next request is
+    answered from the underlying data. Useful when readings look stale or wrong.
+    Leave the target empty to cover every meter on the account.
+  target:
+    device:
+      integration: hildebrandglow_dcc
