@@ -283,7 +283,7 @@ def device_name(resource, virtual_entity) -> str:
 
 def should_update() -> bool:
     """Check if time is between 0-5 or 30-35 minutes past the hour."""
-    minutes = datetime.now().minute
+    minutes = dt_util.now().minute
     return (0 <= minutes <= 5) or (30 <= minutes <= 35)
 
 
@@ -295,17 +295,21 @@ async def daily_data(
     Returns the total for the day along with the start of that day, which the
     cost sensor exposes as its last_reset.
     """
+    # Every time here comes from dt_util so that it follows the timezone
+    # configured in Home Assistant. A plain datetime.now() would follow the
+    # timezone of the host instead, which differs from it on a container
+    # install and would shift the day boundary by the offset between them
+    now = dt_util.now()
     # If it's before 01:06, we need to fetch yesterday's data
     # Should only need to be before 00:36 but gas data can be 30 minutes behind electricity data
-    if datetime.now().time() <= time(1, 5):
+    if now.time() <= time(1, 5):
         _LOGGER.debug("Fetching yesterday's data")
-        now = datetime.now() - timedelta(days=1)
-    else:
-        now = datetime.now()
-    # Timezone-aware start of the day the readings cover
-    day_start = dt_util.start_of_local_day(now.date())
-    # Round to the day to set time to 00:00:00
-    t_from = now.replace(hour=0, minute=0, second=0, microsecond=0)
+        now = now - timedelta(days=1)
+    # Start of the day the readings cover. The query starts from the same
+    # instant that the cost sensor reports as its last_reset, so the total
+    # and the boundary it is measured from can never disagree
+    day_start = dt_util.start_of_local_day(now)
+    t_from = day_start
     # Round to the minute
     t_to = now.replace(second=0, microsecond=0)
 
