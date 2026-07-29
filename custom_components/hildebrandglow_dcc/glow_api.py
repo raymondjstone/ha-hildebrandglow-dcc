@@ -481,7 +481,9 @@ class GlowApiClient:
     async def get_meter_read(self, resource_id: str) -> CurrentReading | None:
         """Return the cumulative register reading of the meter.
 
-        Only available for accounts with a Glow IHD/CAD.
+        Only available for accounts with a Glow IHD/CAD. The unit varies by
+        meter, so callers must honour the units field rather than assuming
+        the kWh shown in the API documentation.
         """
         payload = await self._request(f"resource/{resource_id}/meterread")
         return _parse_single_reading(payload)

@@ -48,6 +48,45 @@ POWER_STALE_AFTER = timedelta(minutes=10)
 USAGE_CLASSIFIERS = ("electricity.consumption", "gas.consumption")
 COST_CLASSIFIERS = ("electricity.consumption.cost", "gas.consumption.cost")
 
+# The API reports the unit alongside instantaneous and register readings,
+# and is not consistent about which one it uses: meter registers come back
+# in Wh on some meters and kWh on others. The reported unit is therefore
+# always honoured rather than assumed
+ENERGY_UNITS = {
+    "wh": UnitOfEnergy.WATT_HOUR,
+    "kwh": UnitOfEnergy.KILO_WATT_HOUR,
+    "mwh": UnitOfEnergy.MEGA_WATT_HOUR,
+}
+VOLUME_UNITS = {
+    "m3": UnitOfVolume.CUBIC_METERS,
+    "m³": UnitOfVolume.CUBIC_METERS,
+    "ft3": UnitOfVolume.CUBIC_FEET,
+    "ft³": UnitOfVolume.CUBIC_FEET,
+}
+POWER_UNITS = {
+    "w": UnitOfPower.WATT,
+    "kw": UnitOfPower.KILO_WATT,
+}
+
+
+def normalise_unit(units: str | None) -> str:
+    """Return an API unit string in the form used by the lookup tables."""
+    return (units or "").strip().lower()
+
+
+def reading_unit(units: str | None) -> tuple[str | None, str | None]:
+    """Map a unit reported by the API to a device class and a HA unit.
+
+    Returns (None, None) for a unit that isn't recognised, so the caller
+    can surface the raw value rather than mislabelling it.
+    """
+    key = normalise_unit(units)
+    if key in ENERGY_UNITS:
+        return SensorDeviceClass.ENERGY, ENERGY_UNITS[key]
+    if key in VOLUME_UNITS:
+        return SensorDeviceClass.GAS, VOLUME_UNITS[key]
+    return None, None
+
 
 async def async_setup_entry(
     hass: HomeAssistant, entry: ConfigEntry, async_add_entities: Callable
@@ -356,12 +395,21 @@ async def hardware_sensors(
             client.get_current(resource.id),
             f"current reading probe for resource {resource.id}",
         )
-        if current is not None and current.units in (None, "W"):
+        power_unit = (
+            POWER_UNITS.get(normalise_unit(current.units))
+            if current is not None
+            else None
+        )
+        if power_unit is not None:
             coordinator = PowerCoordinator(hass, entry, client, resource)
             # Seed the coordinator so the sensor has a value straight away
             coordinator.async_set_updated_data(current)
-            sensors.append(Power(coordinator, resource, virtual_entity))
+            sensors.append(
+                Power(coordinator, resource, virtual_entity, power_unit)
+            )
         else:
+            # An energy unit here means the account has no CAD and the API is
+            # echoing the latest stored reading, which is not a power figure
             _LOGGER.debug(
                 "No live power data for resource %s (units: %s); "
                 "skipping the power sensor",
@@ -673,14 +721,18 @@ class Power(CoordinatorEntity, SensorEntity):
     _attr_device_class = SensorDeviceClass.POWER
     _attr_has_entity_name = True
     _attr_name = "Power (now)"
-    _attr_native_unit_of_measurement = UnitOfPower.WATT
     _attr_state_class = SensorStateClass.MEASUREMENT
+    # Hardware reporting in kW would otherwise be shown a thousand times low
+    _attr_suggested_unit_of_measurement = UnitOfPower.WATT
 
-    def __init__(self, coordinator, resource, virtual_entity) -> None:
-        """Initialize the power sensor."""
+    def __init__(
+        self, coordinator, resource, virtual_entity, unit: str = UnitOfPower.WATT
+    ) -> None:
+        """Initialize the power sensor with the unit the API reported."""
         super().__init__(coordinator)
 
         self._attr_unique_id = resource.id + "-power"
+        self._attr_native_unit_of_measurement = unit
         self.resource = resource
         self.virtual_entity = virtual_entity
 
@@ -706,9 +758,24 @@ class Power(CoordinatorEntity, SensorEntity):
 
     @property
     def native_value(self) -> float | None:
-        """Return the latest power reading in watts."""
+        """Return the latest power reading, in the unit registered at setup."""
         reading = self.coordinator.data
-        return reading.value if reading is not None else None
+        if reading is None:
+            return None
+        if normalise_unit(reading.units) != normalise_unit(
+            self._attr_native_unit_of_measurement
+        ):
+            # Showing a value on a different scale would be worse than
+            # showing none at all
+            _LOGGER.debug(
+                "Ignoring a power reading for resource %s reported in %s, "
+                "expected %s",
+                self.resource.id,
+                reading.units,
+                self._attr_native_unit_of_measurement,
+            )
+            return None
+        return reading.value
 
 
 class MeterReading(SensorEntity):
@@ -727,15 +794,26 @@ class MeterReading(SensorEntity):
         self.client = client
         self.resource = resource
         self.virtual_entity = virtual_entity
+        # Kept so that a later change of unit can be detected rather than
+        # silently rescaling the register by a factor of a thousand
+        self.units = initial.units
 
-        # The API reports the unit alongside the value; gas registers can be
-        # volume (m3) rather than energy depending on the meter
-        if initial.units in ("m3", "m³"):
-            self._attr_device_class = SensorDeviceClass.GAS
-            self._attr_native_unit_of_measurement = UnitOfVolume.CUBIC_METERS
-        else:
-            self._attr_device_class = SensorDeviceClass.ENERGY
-            self._attr_native_unit_of_measurement = UnitOfEnergy.KILO_WATT_HOUR
+        device_class, unit = reading_unit(initial.units)
+        if device_class is None:
+            _LOGGER.warning(
+                "The Glow API reported the meter register for the %s meter "
+                "(id: %s) in an unrecognised unit (%s). The reading is shown "
+                "unconverted; please open an issue quoting that unit",
+                supply_type(resource),
+                resource.id,
+                initial.units,
+            )
+        self._attr_device_class = device_class
+        self._attr_native_unit_of_measurement = unit
+        if device_class == SensorDeviceClass.ENERGY:
+            # Registers are reported in Wh by some meters and kWh by others,
+            # so display them consistently whichever way they arrive
+            self._attr_suggested_unit_of_measurement = UnitOfEnergy.KILO_WATT_HOUR
         self._attr_native_value = initial.value
 
     @property
@@ -754,8 +832,22 @@ class MeterReading(SensorEntity):
             self.client.get_meter_read(self.resource.id),
             f"meter read for resource {self.resource.id}",
         )
-        if reading is not None:
-            self._attr_native_value = reading.value
+        if reading is None:
+            return
+        if normalise_unit(reading.units) != normalise_unit(self.units):
+            # Storing a value on a different scale would corrupt the
+            # long term statistics, so wait for the restart that recreates
+            # the sensor against the new unit
+            _LOGGER.warning(
+                "The Glow API changed the meter register unit for resource "
+                "%s from %s to %s. Ignoring the new reading; restart Home "
+                "Assistant to rebuild the sensor with the new unit",
+                self.resource.id,
+                self.units,
+                reading.units,
+            )
+            return
+        self._attr_native_value = reading.value
 
 
 class TariffHistory(SensorEntity):
