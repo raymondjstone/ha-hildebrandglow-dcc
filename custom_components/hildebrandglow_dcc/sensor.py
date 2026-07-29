@@ -393,27 +393,29 @@ async def hardware_sensors(
     sensors: list[SensorEntity] = []
 
     # Live power draw, electricity only. Without a CAD the endpoint echoes
-    # the latest stored kWh reading instead, so require the unit to be watts
+    # the latest stored reading, which is an energy figure rather than a
+    # power one, so an energy unit is what rules the sensor out. A missing
+    # unit is not: the API does not always report one, and this endpoint
+    # still returns live watts when it doesn't
     if resource.classifier == "electricity.consumption":
         current = await probe_call(
             client.get_current(resource.id),
             f"current reading probe for resource {resource.id}",
         )
-        power_unit = (
-            POWER_UNITS.get(normalise_unit(current.units))
-            if current is not None
-            else None
-        )
-        if power_unit is not None:
+        reported = normalise_unit(current.units) if current is not None else ""
+        if current is not None and reported not in ENERGY_UNITS:
             coordinator = PowerCoordinator(hass, entry, client, resource)
             # Seed the coordinator so the sensor has a value straight away
             coordinator.async_set_updated_data(current)
             sensors.append(
-                Power(coordinator, resource, virtual_entity, power_unit)
+                Power(
+                    coordinator,
+                    resource,
+                    virtual_entity,
+                    POWER_UNITS.get(reported, UnitOfPower.WATT),
+                )
             )
         else:
-            # An energy unit here means the account has no CAD and the API is
-            # echoing the latest stored reading, which is not a power figure
             _LOGGER.debug(
                 "No live power data for resource %s (units: %s); "
                 "skipping the power sensor",
@@ -761,16 +763,26 @@ class Power(CoordinatorEntity, SensorEntity):
         )
 
     @property
+    def extra_state_attributes(self) -> dict:
+        """Expose the unit the API reported, which it sometimes omits."""
+        reading = self.coordinator.data
+        return {
+            "reported_unit": reading.units if reading is not None else None,
+        }
+
+    @property
     def native_value(self) -> float | None:
         """Return the latest power reading, in the unit registered at setup."""
         reading = self.coordinator.data
         if reading is None:
             return None
-        if normalise_unit(reading.units) != normalise_unit(
-            self._attr_native_unit_of_measurement
+        reported = normalise_unit(reading.units)
+        if (
+            reported in POWER_UNITS
+            and POWER_UNITS[reported] != self._attr_native_unit_of_measurement
         ):
-            # Showing a value on a different scale would be worse than
-            # showing none at all
+            # Only a unit that is recognised and different is a reason to
+            # withhold the value; an unreported unit is not
             _LOGGER.debug(
                 "Ignoring a power reading for resource %s reported in %s, "
                 "expected %s",
@@ -804,13 +816,20 @@ class MeterReading(SensorEntity):
 
         device_class, unit = reading_unit(initial.units)
         if device_class is None:
+            # The API does not always report a unit on this endpoint. Fall
+            # back to the one from the resource definition rather than
+            # dropping the sensor, which is the worse failure
+            device_class, unit = reading_unit(resource.base_unit)
             _LOGGER.warning(
                 "The Glow API reported the meter register for the %s meter "
-                "(id: %s) in an unrecognised unit (%s). The reading is shown "
-                "unconverted; please open an issue quoting that unit",
+                "(id: %s) with an unrecognised unit (%r), so the unit from "
+                "the resource definition (%r) is being used instead. If the "
+                "reading looks wrong by a factor of a thousand, please open "
+                "an issue quoting both units",
                 supply_type(resource),
                 resource.id,
                 initial.units,
+                resource.base_unit,
             )
         self._attr_device_class = device_class
         self._attr_native_unit_of_measurement = unit
@@ -819,6 +838,10 @@ class MeterReading(SensorEntity):
             # so display them consistently whichever way they arrive
             self._attr_suggested_unit_of_measurement = UnitOfEnergy.KILO_WATT_HOUR
         self._attr_native_value = initial.value
+        self._attr_extra_state_attributes = {
+            "reported_unit": initial.units,
+            "resource_base_unit": resource.base_unit,
+        }
 
     @property
     def device_info(self) -> DeviceInfo:
