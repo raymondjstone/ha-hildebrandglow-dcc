@@ -63,7 +63,7 @@ Where the API can report it, the meter's own identifying number is also recorded
 If your account has Glow hardware (an IHD/CAD), the integration detects this automatically at startup and creates these additional entities:
 
 - Power (now) - Live electricity power draw in watts, polled once a minute. Marked unavailable if the hardware stops reporting for more than 10 minutes.
-- Meter reading - The cumulative register reading as shown on the meter itself. Meters report this in different units (Wh, kWh, or m³ for volume-based gas registers); whichever unit the API reports is used, and energy registers are displayed in kWh.
+- Meter reading - The cumulative register reading as shown on the meter itself. On a dual-rate meter, such as Economy 7, this is the **combined** total of the day and night registers rather than either one on its own, so it will not match either figure shown individually on the meter's display. Meters report this in different units (Wh, kWh, or m³ for volume-based gas registers); whichever unit the API reports is used, and energy registers are displayed in kWh.
 - Connectivity - A binary sensor per gateway device showing whether it is still sending data to the Glow platform, with the last-seen time as an attribute (diagnostic)
 
 Accounts without Glow hardware simply don't get the hardware entities; the endpoints are probed once at startup and skipped silently if unsupported.

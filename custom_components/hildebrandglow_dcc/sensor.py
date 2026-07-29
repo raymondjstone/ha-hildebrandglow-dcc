@@ -795,7 +795,12 @@ class Power(CoordinatorEntity, SensorEntity):
 
 
 class MeterReading(SensorEntity):
-    """Sensor for the cumulative register reading of the meter itself."""
+    """Sensor for the cumulative register reading of the meter itself.
+
+    On a dual-rate meter, such as Economy 7, the API reports the combined
+    total of the day and night registers, so the value will not match
+    either of the figures the meter displays individually.
+    """
 
     _attr_has_entity_name = True
     _attr_icon = "mdi:counter"
